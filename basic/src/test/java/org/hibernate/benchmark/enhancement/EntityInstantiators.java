@@ -4,7 +4,9 @@ import java.lang.reflect.Method;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.stream.IntStream;
 
+import org.hibernate.AssertionFailure;
 import org.hibernate.HibernateException;
 import org.hibernate.Session;
 import org.hibernate.SessionFactory;
@@ -30,55 +32,142 @@ import org.hibernate.type.CompositeType;
 
 import jakarta.persistence.Entity;
 import jakarta.persistence.Id;
-import org.openjdk.jmh.annotations.AuxCounters;
-import org.openjdk.jmh.annotations.Benchmark;
-import org.openjdk.jmh.annotations.Scope;
-import org.openjdk.jmh.annotations.Setup;
-import org.openjdk.jmh.annotations.State;
-import org.openjdk.jmh.annotations.TearDown;
+import org.openjdk.jmh.annotations.*;
 import org.openjdk.jmh.infra.Blackhole;
+import org.openjdk.jmh.infra.Control;
 
 /**
  * @author Marco Belladelli
  */
 @State( Scope.Thread )
+@Warmup( iterations = 10, time = 2 )
+@Measurement( iterations = 10, time = 1 )
 public class EntityInstantiators {
-	private static final int FORTUNES = 100;
 
-	private SessionFactory standardSessionFactory;
-	private Session standardSession;
-
-	private SessionFactory optimizedSessionFactory;
-	private Session optimizedSession;
-
-	@Setup
-	public void setup() {
-		standardSessionFactory = getSessionFactory( new BytecodeProviderImpl(), EntityInstantiatorPojoStandard.class );
-		optimizedSessionFactory = getSessionFactory(
-				new FortuneBytecodeProvider(),
-				EntityInstantiatorPojoOptimized.class
-		);
-
-		populateData( standardSessionFactory );
-
-		standardSession = standardSessionFactory.openSession();
-		standardSession.getTransaction().begin();
-		optimizedSession = optimizedSessionFactory.openSession();
-		optimizedSession.getTransaction().begin();
+	public enum Instantiation {
+		Standard, Optimized
 	}
 
-	private void populateData(SessionFactory sf) {
+	public enum Morphism {
+		MONO, BI, TRI, QUAD;
+
+		int types() {
+			return switch (this) {
+				case MONO -> 1;
+				case BI -> 2;
+				case TRI -> 3;
+				case QUAD -> 4;
+			};
+		}
+	}
+
+	@Param
+	private Instantiation instantiation;
+
+	@Param
+	private Morphism morphism;
+
+	@Param( { "false", "true" } )
+	private boolean polluteAtWarmup;
+
+	@Param( { "100" } )
+	private int count;
+
+	private SessionFactory sessionFactory;
+	private Session session;
+
+	int nextEntityTypeId;
+	int[] entityTypes;
+
+	@Setup
+	public void setup(Blackhole bh) {
+		int types = morphism.types();
+		if (types == 1 && polluteAtWarmup) {
+			// this is fairly useless
+			throw new IllegalStateException("Cannot pollute with monomorphic types");
+		}
+		switch (instantiation) {
+			case Optimized -> sessionFactory = getSessionFactory( new FortuneBytecodeProvider(), EntityInstantiatorPojoOptimized.class, types);
+			case Standard -> sessionFactory = getSessionFactory( new BytecodeProviderImpl(), EntityInstantiatorPojoStandard.class, types);
+		}
+		populateData( sessionFactory, count, types);
+		session = sessionFactory.openSession();
+		session.getTransaction().begin();;
+		nextEntityTypeId = 0;
+		entityTypes = new int[types];
+		for (int i = 0; i < types; i++) {
+			entityTypes[i] = i;
+		}
+		if (polluteAtWarmup) {
+			// this is ensuring that every each queryFortuneX method is called enough to be fully compiled
+			for (int i = 0; i < 10_000; i++) {
+				switch (types) {
+					case 4:
+						queryFortune3(session, bh);
+					case 3:
+						queryFortune2(session, bh);
+					case 2:
+						queryFortune1(session, bh);
+					case 1:
+						queryFortune0(session, bh);
+				}
+			}
+			// force to make it monomorphic now
+			entityTypes = new int[] {0};
+			nextEntityTypeId = 0;
+		}
+	}
+
+	private int nextEntityTypeId() {
+		var entityTypes = this.entityTypes;
+		if (nextEntityTypeId >= entityTypes.length) {
+			nextEntityTypeId = 1;
+			return entityTypes[0];
+		} else {
+			return entityTypes[nextEntityTypeId++];
+		}
+	}
+
+	private void populateData(SessionFactory sf, int count, int types) {
+		if (types == 0 || types > 4) {
+			throw new IllegalArgumentException("Invalid types");
+		}
 		final Session session = sf.openSession();
 		session.getTransaction().begin();
-		for ( int i = 0; i < FORTUNES; i++ ) {
-			session.persist( new Fortune( i ) );
+		switch (types) {
+			case 4:
+				for (int i = 0; i < count; i++) {
+					session.persist(new Fortune3(i));
+				}
+			case 3:
+				for (int i = 0; i < count; i++) {
+					session.persist(new Fortune2(i));
+				}
+			case 2:
+				for (int i = 0; i < count; i++) {
+					session.persist(new Fortune1(i));
+				}
+			case 1:
+				for (int i = 0; i < count; i++) {
+					session.persist(new Fortune0(i));
+				}
 		}
 		session.getTransaction().commit();
 		session.close();
 	}
 
-	protected SessionFactory getSessionFactory(BytecodeProvider bytecodeProvider, Class<?> expectedInstantiatorClass) {
-		final Configuration config = new Configuration().addAnnotatedClass( Fortune.class );
+	protected SessionFactory getSessionFactory(BytecodeProvider bytecodeProvider, Class<?> expectedInstantiatorClass, int types) {
+		final Configuration config = new Configuration();
+		switch (types) {
+			case 4:
+				config.addAnnotatedClass( Fortune3.class );
+			case 3:
+				config.addAnnotatedClass( Fortune2.class );
+			case 2:
+				config.addAnnotatedClass( Fortune1.class );
+			case 1:
+				config.addAnnotatedClass( Fortune0.class );
+		}
 		final StandardServiceRegistryBuilder srb = config.getStandardServiceRegistryBuilder();
 		srb.applySetting( AvailableSettings.SHOW_SQL, false )
 				.applySetting( AvailableSettings.LOG_SESSION_METRICS, false )
@@ -90,88 +179,178 @@ public class EntityInstantiators {
 		// force no runtime bytecode-enhancement
 		srb.addService( BytecodeProvider.class, bytecodeProvider );
 		final SessionFactoryImplementor sf = (SessionFactoryImplementor) config.buildSessionFactory( srb.build() );
-
-		final EntityInstantiator instantiator = sf.getMappingMetamodel()
-				.getEntityDescriptor( Fortune.class )
-				.getRepresentationStrategy()
-				.getInstantiator();
-		if ( !expectedInstantiatorClass.isInstance( instantiator ) ) {
-			throw new IllegalStateException( "The entity instantiator is not a EntityInstantiatorPojoStandard" );
+		final EntityInstantiator[] instantiators = new EntityInstantiator[types];
+		switch (types) {
+			case 4:
+				instantiators[3] = sf.getMappingMetamodel()
+						.getEntityDescriptor( Fortune3.class )
+						.getRepresentationStrategy()
+						.getInstantiator();
+			case 3:
+				instantiators[2] = sf.getMappingMetamodel()
+						.getEntityDescriptor( Fortune2.class )
+						.getRepresentationStrategy()
+						.getInstantiator();
+			case 2:
+				instantiators[1] = sf.getMappingMetamodel()
+						.getEntityDescriptor( Fortune1.class )
+						.getRepresentationStrategy()
+						.getInstantiator();
+			case 1:
+				instantiators[0] = sf.getMappingMetamodel()
+						.getEntityDescriptor( Fortune0.class )
+						.getRepresentationStrategy()
+						.getInstantiator();
 		}
-
+		boolean found = false;
+		for (EntityInstantiator instantiator : instantiators) {
+			found |= expectedInstantiatorClass.isInstance( instantiator );
+		}
+		if (!found) {
+			throw new AssertionFailure( "Expected instantiator not found" );
+		}
 		return sf;
 	}
 
 	@TearDown
 	public void destroy() {
-		standardSession.getTransaction().commit();
-		standardSession.close();
-		standardSessionFactory.close();
-
-		optimizedSession.getTransaction().commit();
-		optimizedSession.close();
-		optimizedSessionFactory.close();
-	}
-
-	@State( Scope.Thread )
-	@AuxCounters( AuxCounters.Type.OPERATIONS )
-	public static class EventCounters {
-		public long instances;
+		session.getTransaction().commit();
+		session.close();
 	}
 
 	@Benchmark
-	public void standard(Blackhole bh, EventCounters counters) {
-		queryFortune( standardSession, bh, counters );
-	}
-
-	@Benchmark
-	public void optimized(Blackhole bh, EventCounters counters) {
-		queryFortune( optimizedSession, bh, counters );
-	}
-
-	protected void queryFortune(Session session, Blackhole bh, EventCounters counters) {
-		final List<Fortune> results = session.createQuery( "from Fortune", Fortune.class ).getResultList();
-		for ( Fortune fortune : results ) {
-			if ( bh != null ) {
-				bh.consume( fortune );
-			}
+	public int query(Blackhole bh) {
+		int nextEntityTypeId = nextEntityTypeId();
+		final int count;
+		switch (nextEntityTypeId) {
+			case 0:
+				count = queryFortune0( session, bh);
+				break;
+			case 1:
+				count = queryFortune1( session, bh);
+				break;
+			case 2:
+				count = queryFortune2( session, bh);
+				break;
+			case 3:
+				count = queryFortune3( session, bh);
+				break;
+			default:
+				throw new AssertionError("it shouldn't happen!");
 		}
-		if ( counters != null ) {
-			counters.instances += results.size();
+		return count;
+	}
+
+	@CompilerControl(CompilerControl.Mode.DONT_INLINE)
+	private static int queryFortune2(Session session, Blackhole bh) {
+		final List<Fortune2> results = session.createQuery( "from Fortune2", Fortune2.class ).getResultList();
+		int count = 0;
+		for ( Fortune2 fortune : results ) {
+			if ( bh != null ) {
+				bh.consume(fortune);
+			}
+			count++;
 		}
 		session.clear();
+		return count;
 	}
 
-	@Entity( name = "Fortune" )
-	static class Fortune {
+	@CompilerControl(CompilerControl.Mode.DONT_INLINE)
+	private static int queryFortune3(Session session, Blackhole bh) {
+		final List<Fortune3> results = session.createQuery( "from Fortune3", Fortune3.class ).getResultList();
+		int count = 0;
+		for ( Fortune3 fortune : results ) {
+			if ( bh != null ) {
+				bh.consume(fortune);
+			}
+			count++;
+		}
+		session.clear();
+		return count;
+	}
+
+	@CompilerControl(CompilerControl.Mode.DONT_INLINE)
+	private static int queryFortune1(Session session, Blackhole bh) {
+		final List<Fortune1> results = session.createQuery( "from Fortune1", Fortune1.class ).getResultList();
+		int count = 0;
+		for ( Fortune1 fortune : results ) {
+			if ( bh != null ) {
+				bh.consume(fortune);
+			}
+			count++;
+		}
+		session.clear();
+		return count;
+	}
+
+	@CompilerControl(CompilerControl.Mode.DONT_INLINE)
+	private static int queryFortune0(Session session, Blackhole bh) {
+		final List<Fortune0> results = session.createQuery( "from Fortune0", Fortune0.class ).getResultList();
+		int count = 0;
+		for ( Fortune0 fortune0 : results ) {
+			if ( bh != null ) {
+				bh.consume(fortune0);
+			}
+			count++;
+		}
+		session.clear();
+		return count;
+	}
+
+	@Entity( name = "Fortune0" )
+	static class Fortune0 {
 		@Id
 		public Integer id;
 
-		public Fortune() {
+		public Fortune0() {
 		}
 
-		public Fortune(Integer id) {
+		public Fortune0(Integer id) {
 			this.id = id;
 		}
 	}
 
-	public static void main(String[] args) {
-		EntityInstantiators jpaBenchmark = new EntityInstantiators();
-		jpaBenchmark.setup();
+	@Entity( name = "Fortune1" )
+	static class Fortune1 {
+		@Id
+		public Integer id;
 
-		for ( int i = 0; i < 1; i++ ) {
-			jpaBenchmark.standard( null, null );
+		public Fortune1() {
 		}
 
-		for ( int i = 0; i < 1; i++ ) {
-			jpaBenchmark.optimized( null, null );
+		public Fortune1(Integer id) {
+			this.id = id;
+		}
+	}
+
+	@Entity( name = "Fortune2" )
+	static class Fortune2 {
+		@Id
+		public Integer id;
+
+		public Fortune2() {
 		}
 
-		jpaBenchmark.destroy();
+		public Fortune2(Integer id) {
+			this.id = id;
+		}
+	}
+
+	@Entity( name = "Fortune3" )
+	static class Fortune3 {
+		@Id
+		public Integer id;
+
+		public Fortune3() {
+		}
+
+		public Fortune3(Integer id) {
+			this.id = id;
+		}
 	}
 
 	/**
-	 * Empty {@link BytecodeProvider} which only provides the {@link FortuneInstantiator} static optimizer
+	 * Empty {@link BytecodeProvider} which only provides the different Fortune static optimizers
 	 */
 	static class FortuneBytecodeProvider implements BytecodeProvider {
 		@Override
@@ -193,18 +372,45 @@ public class EntityInstantiators {
 		public ReflectionOptimizer getReflectionOptimizer(
 				Class<?> clazz,
 				Map<String, PropertyAccess> propertyAccessMap) {
-			assert clazz == Fortune.class;
-			return new ReflectionOptimizer() {
-				@Override
-				public InstantiationOptimizer getInstantiationOptimizer() {
-					return new FortuneInstantiator();
-				}
+			if (clazz == Fortune0.class) {
+				return new ReflectionOptimizer() {
+					@Override
+					public InstantiationOptimizer getInstantiationOptimizer() {
+						return new Fortune0Instantiator();
+					}
 
-				@Override
-				public AccessOptimizer getAccessOptimizer() {
-					return null;
-				}
-			};
+					@Override
+					public AccessOptimizer getAccessOptimizer() {
+						return null;
+					}
+				};
+			} else if (clazz == Fortune1.class) {
+				return new ReflectionOptimizer() {
+					@Override
+					public InstantiationOptimizer getInstantiationOptimizer() {
+						return new Fortune1Instantiator();
+					}
+
+					@Override
+					public AccessOptimizer getAccessOptimizer() {
+						return null;
+					}
+				};
+			} else if (clazz == Fortune2.class) {
+				return new ReflectionOptimizer() {
+					@Override
+					public InstantiationOptimizer getInstantiationOptimizer() {
+						return new Fortune2Instantiator();
+					}
+
+					@Override
+					public AccessOptimizer getAccessOptimizer() {
+						return null;
+					}
+				};
+			} else {
+				return null;
+			}
 		}
 
 		@Override
@@ -217,10 +423,32 @@ public class EntityInstantiators {
 	 * Implementation of {@link ReflectionOptimizer.InstantiationOptimizer}
 	 * which reflects the generated bytecode in both Hibernate and Quarkus
 	 */
-	static class FortuneInstantiator implements ReflectionOptimizer.InstantiationOptimizer {
+	static class Fortune0Instantiator implements ReflectionOptimizer.InstantiationOptimizer {
 		@Override
 		public Object newInstance() {
-			return new Fortune();
+			return new Fortune0();
+		}
+	}
+
+	/**
+	 * Implementation of {@link ReflectionOptimizer.InstantiationOptimizer}
+	 * which reflects the generated bytecode in both Hibernate and Quarkus
+	 */
+	static class Fortune1Instantiator implements ReflectionOptimizer.InstantiationOptimizer {
+		@Override
+		public Object newInstance() {
+			return new Fortune1();
+		}
+	}
+
+	/**
+	 * Implementation of {@link ReflectionOptimizer.InstantiationOptimizer}
+	 * which reflects the generated bytecode in both Hibernate and Quarkus
+	 */
+	static class Fortune2Instantiator implements ReflectionOptimizer.InstantiationOptimizer {
+		@Override
+		public Object newInstance() {
+			return new Fortune2();
 		}
 	}
 

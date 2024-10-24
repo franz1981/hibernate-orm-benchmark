@@ -18,11 +18,20 @@ fi
 
 ./gradlew jmhJar -Porm=${ORM_VERSION}
 
-java -jar basic/target/libs/hibernate-orm-benchmark-basic-1.0-SNAPSHOT-jmh.jar EntityInstantiators -f 2 -prof gc -prof "async:rawCommand=alloc,wall;event=cpu;output=jfr;dir=/tmp;libPath=${ASYNC_PROFILER_HOME}/lib/libasyncProfiler.so" -pcount=100
+java -jar basic/target/libs/hibernate-orm-benchmark-basic-1.0-SNAPSHOT-jmh.jar EntityInstantiators -pmorphism=QUAD -f 2 -gc true -prof gc -prof "async:rawCommand=features=vtable;event=cpu;output=jfr;dir=/tmp;libPath=${ASYNC_PROFILER_HOME}/lib/libasyncProfiler.so" -pcount=100
 
-java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --alloc --total /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators.standard-Throughput/jfr-cpu.jfr EntityInstantiators-standard-alloc-${ORM_VERSION}.html
-java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --state default /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators.standard-Throughput/jfr-cpu.jfr EntityInstantiators-standard-cpu-${ORM_VERSION}.html
-java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --state runnable,sleeping /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators.standard-Throughput/jfr-cpu.jfr EntityInstantiators-standard-wall-${ORM_VERSION}.html
-java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --alloc --total /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators.optimized-Throughput/jfr-cpu.jfr EntityInstantiators-optimized-alloc-${ORM_VERSION}.html
-java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --state default /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators.optimized-Throughput/jfr-cpu.jfr EntityInstantiators-optimized-cpu-${ORM_VERSION}.html
-java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --state runnable,sleeping /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators.optimized-Throughput/jfr-cpu.jfr EntityInstantiators-optimized-wall-${ORM_VERSION}.html
+# first search for all the jfr files in /tmp which contains EntityInstantiators as name
+# then run the jfr2flame tool to generate the flamegraphs
+
+# Find all jfr files in /tmp containing EntityInstantiators in the name
+jfr_files=$(find /tmp/org.hibernate.benchmark.enhancement.EntityInstantiators*/jfr-cpu.jfr)
+# list the jfr files with some comment in between
+echo "JFR files found:"
+echo $jfr_files
+# Run the jfr2flame tool to generate the flamegraphs
+echo "Flamegraphs produced:"
+for jfr_file in $jfr_files; do
+  java -cp ${ASYNC_PROFILER_HOME}/lib/converter.jar jfr2flame --lines $jfr_file ${jfr_file%.jfr}-cpu.html
+  # print the produced ones
+  echo ${jfr_file%.jfr}-cpu.html
+done
